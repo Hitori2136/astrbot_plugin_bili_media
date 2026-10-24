@@ -461,9 +461,11 @@ class PluginSettings:
 
         cookies_file = str(get("cookies_file", "") or "").strip()
         if cookies_file:
-            candidate = Path(os.path.expanduser(cookies_file))
+            candidate = Path(
+                os.path.expanduser(cookies_file.strip().strip('"').strip("'"))
+            )
             if candidate.is_file():
-                cookies_file = str(candidate)
+                cookies_file = str(candidate.resolve())
             else:
                 logger.warning("B 站 cookies_file 不存在，已忽略：%s", cookies_file)
                 cookies_file = ""
@@ -509,25 +511,28 @@ def _imageio_ffmpeg_exe() -> str | None:
     except Exception as exc:  # 下载/解压失败等
         logger.debug("imageio-ffmpeg unavailable: %s", redact(exc))
         return None
-    return exe if exe and Path(exe).is_file() else None
+    if exe and Path(exe).is_file():
+        return str(Path(exe).resolve())
+    return None
 
 
 def resolve_ffmpeg(configured_path: str = "") -> str:
     """按配置 -> PATH -> imageio-ffmpeg 的顺序找到 ffmpeg。"""
-    configured_path = str(configured_path or "").strip()
+    configured_path = str(configured_path or "").strip().strip('"').strip("'")
     if configured_path:
         candidate = Path(os.path.expanduser(configured_path))
         if candidate.is_dir():
             candidate = candidate / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
         if candidate.is_file():
-            return str(candidate)
+            # worker 的 cwd 是临时目录，必须返回绝对路径。
+            return str(candidate.resolve())
         raise FfmpegMissingError(
             f"配置的 ffmpeg 路径不存在：{configured_path}"
         )
 
     found = shutil.which("ffmpeg")
     if found:
-        return found
+        return str(Path(found).resolve())
 
     bundled = _imageio_ffmpeg_exe()
     if bundled:
@@ -544,6 +549,7 @@ async def convert_to_wav(
     target: Path,
     ffmpeg: str,
     timeout: float = 180.0,
+    processes: set[asyncio.subprocess.Process] | None = None,
 ) -> Path:
     """把任意音频转成 16kHz 单声道 16-bit PCM WAV，方便切片与 silk 编码。"""
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -594,18 +600,27 @@ async def convert_to_wav(
             stderr=log_file,
             **popen_kwargs,
         )
+        if processes is not None:
+            processes.add(process)
         try:
-            await asyncio.wait_for(process.wait(), timeout=timeout)
-        except asyncio.TimeoutError as exc:
-            process.kill()
-            await process.wait()
-            raise AudioConversionError("音频转码超时，请换更短的视频。") from exc
+            try:
+                await asyncio.wait_for(process.wait(), timeout=timeout)
+            except asyncio.TimeoutError as exc:
+                await _kill_process(process)
+                raise AudioConversionError("音频转码超时，请换更短的视频。") from exc
+            except asyncio.CancelledError:
+                await _kill_process(process)
+                raise
+            except Exception:
+                await _kill_process(process)
+                raise
+        finally:
+            if processes is not None:
+                processes.discard(process)
 
     detail = ""
     try:
-        detail = _short_error(
-            log_path.read_text(encoding="utf-8", errors="replace")
-        )
+        detail = _short_error(_read_text_tail(log_path))
     except OSError:
         pass
 
@@ -904,6 +919,20 @@ def _write_private_text(path: Path, text: str) -> None:
         os.chmod(path, 0o600)
 
 
+async def _kill_process(process: asyncio.subprocess.Process) -> None:
+    """确保超时/取消时子进程被终止，避免留下孤儿进程。"""
+    if process.returncode is not None:
+        return
+    try:
+        process.kill()
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except (asyncio.TimeoutError, ProcessLookupError, OSError):
+        pass
+
+
 class BiliService:
     """把 yt-dlp 的同步调用包在 asyncio.to_thread 里。"""
 
@@ -915,12 +944,19 @@ class BiliService:
         self.worker_path = Path(__file__).resolve().with_name(
             "bili_ytdlp_worker.py"
         )
+        self.active_processes: set[asyncio.subprocess.Process] = set()
 
     def set_ffmpeg(self, ffmpeg: str) -> None:
         self.ffmpeg = ffmpeg
 
     def set_cookie(self, cookie: str | None) -> None:
         self.cookie = str(cookie).strip() if cookie else None
+
+    async def aclose(self) -> None:
+        """插件卸载时终止仍在运行的 worker/ffmpeg 子进程。"""
+        for process in list(self.active_processes):
+            await _kill_process(process)
+        self.active_processes.clear()
 
     def _base_opts(self, outdir: Path) -> dict[str, Any]:
         opts: dict[str, Any] = {
@@ -978,11 +1014,17 @@ class BiliService:
         request_path = workdir / "request.json"
         result_path = workdir / "result.json"
         log_path = workdir / "ytdlp.log"
+        process: asyncio.subprocess.Process | None = None
         try:
             clean_opts = dict(opts)
             clean_opts.pop("logger", None)
             clean_opts.pop("progress_hooks", None)
-            payload = {"url": url, "opts": clean_opts, "download": download}
+            payload = {
+                "url": url,
+                "opts": clean_opts,
+                "download": download,
+                "max_result_bytes": self.settings.max_parse_bytes,
+            }
             try:
                 request_text = json.dumps(payload, ensure_ascii=False)
             except (TypeError, ValueError) as exc:
@@ -1014,17 +1056,26 @@ class BiliService:
                     raise MissingDependencyError(
                         "无法启动 yt-dlp 子进程，请检查 Python 环境。"
                     ) from exc
+                self.active_processes.add(process)
 
                 try:
-                    await asyncio.wait_for(
-                        process.wait(), timeout=self.settings.timeout_seconds
-                    )
-                except asyncio.TimeoutError as exc:
-                    process.kill()
-                    await process.wait()
-                    raise DownloadFailedError(
-                        "处理超时，已终止 yt-dlp 子进程。请换更短的视频或稍后重试。"
-                    ) from exc
+                    try:
+                        await asyncio.wait_for(
+                            process.wait(), timeout=self.settings.timeout_seconds
+                        )
+                    except asyncio.TimeoutError as exc:
+                        await _kill_process(process)
+                        raise DownloadFailedError(
+                            "处理超时，已终止 yt-dlp 子进程。请换更短的视频或稍后重试。"
+                        ) from exc
+                    except asyncio.CancelledError:
+                        await _kill_process(process)
+                        raise
+                    except Exception:
+                        await _kill_process(process)
+                        raise
+                finally:
+                    self.active_processes.discard(process)
 
             result: dict[str, Any] | None = None
             if result_path.is_file():
@@ -1044,6 +1095,10 @@ class BiliService:
                 if result.get("error_type") == "ModuleNotFoundError":
                     raise MissingDependencyError(
                         "当前子进程缺少 yt-dlp 依赖，请重载插件安装 requirements.txt。"
+                    )
+                if result.get("error_type") == "ResultTooLarge":
+                    raise DownloadFailedError(
+                        f"yt-dlp 解析结果超过 {self.settings.max_parse_mb}MB 上限。"
                     )
                 raise map_download_error(Exception(error or "yt-dlp 执行失败"))
 
@@ -1067,6 +1122,8 @@ class BiliService:
             return info
 
         finally:
+            if process is not None:
+                self.active_processes.discard(process)
             shutil.rmtree(workdir, ignore_errors=True)
 
     async def _unwrap_info(self, info: dict[str, Any], page: int) -> dict[str, Any]:
@@ -1123,6 +1180,8 @@ class BiliService:
                     raise DownloadFailedError("下载完成但没有找到视频文件。")
                 size = path.stat().st_size
                 last_size = size
+                if size <= 0:
+                    raise DownloadFailedError("下载的视频文件为空。")
                 if size > self.settings.max_download_bytes:
                     raise MediaTooLargeError(
                         f"视频文件超过下载上限 {self.settings.max_download_mb}MB。"
@@ -1138,6 +1197,9 @@ class BiliService:
                 shutil.rmtree(attempt, ignore_errors=True)
             except UserVisibleError as exc:
                 shutil.rmtree(attempt, ignore_errors=True)
+                if isinstance(exc, MediaTooLargeError) and index + 1 < len(choices):
+                    logger.info("清晰度 %s 超出大小限制，尝试下一档", choice.label)
+                    continue
                 if index + 1 < len(choices) and _is_retryable_video_error(exc):
                     logger.info("清晰度 %s 不可用，尝试下一档", choice.label)
                     continue
@@ -1147,9 +1209,10 @@ class BiliService:
                 raise map_download_error(exc) from exc
 
         raise MediaTooLargeError(
-            f"视频超过 {self.settings.max_video_mb}MB 上限，已尝试较低清晰度仍超出"
-            f"（最后一次 {last_size / 1024 / 1024:.1f}MB）。可提高 max_video_mb，"
-            "或改用 /提取音频。"
+            f"视频超过大小上限（视频 {self.settings.max_video_mb}MB / "
+            f"下载 {self.settings.max_download_mb}MB），已尝试较低清晰度仍超出"
+            f"（最后一次 {last_size / 1024 / 1024:.1f}MB）。"
+            "可提高对应上限，或改用 /提取音频。"
         )
 
     async def fetch_audio(
@@ -1161,13 +1224,17 @@ class BiliService:
         opts["format"] = (
             "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best"
         )
-        opts["max_filesize"] = self.settings.max_audio_bytes
+        opts["max_filesize"] = min(
+            self.settings.max_audio_bytes, self.settings.max_download_bytes
+        )
         await self._extract(target.url, opts, True)
         path = _find_downloaded(
             attempt, {".m4a", ".mp3", ".webm", ".opus", ".aac", ".flac", ".ogg", ".wav"}
         )
         if path is None:
             raise DownloadFailedError("下载完成但没有找到音频文件。")
+        if path.stat().st_size <= 0:
+            raise DownloadFailedError("下载的音频文件为空。")
         if path.stat().st_size > self.settings.max_download_bytes:
             raise MediaTooLargeError(
                 f"音频源文件超过下载上限 {self.settings.max_download_mb}MB。"
@@ -1625,6 +1692,7 @@ class BiliMediaPlugin(Star):
                     wav_path,
                     ffmpeg,
                     timeout=min(240, self.settings.timeout_seconds),
+                    processes=self.service.active_processes,
                 )
                 chunks = slice_wav(
                     wav_path,
@@ -1716,8 +1784,8 @@ class BiliMediaPlugin(Star):
             logger.warning("B 站扫码凭据格式错误，已忽略。")
             return None
         cookie = str(data.get("cookie") or "").strip()
-        if not cookie:
-            logger.warning("B 站扫码凭据缺少 cookie，已忽略。")
+        if not cookie or "SESSDATA=" not in cookie or "\n" in cookie or "\r" in cookie:
+            logger.warning("B 站扫码凭据缺少有效的 SESSDATA，已忽略。")
             return None
         data["cookie"] = cookie
         return data
@@ -1899,6 +1967,7 @@ class BiliMediaPlugin(Star):
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await self.service.aclose()
         for path in list(self._tmp_dirs):
             self._rmtree(path)
         logger.debug("astrbot_plugin_bili_media 已卸载")

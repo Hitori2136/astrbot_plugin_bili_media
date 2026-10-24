@@ -49,6 +49,7 @@ def main() -> int:
     opts.pop("logger", None)
     opts.pop("progress_hooks", None)
     opts["logger"] = _SilentLogger()
+    max_result_bytes = int(payload.get("max_result_bytes") or 0)
 
     try:
         import yt_dlp
@@ -62,18 +63,26 @@ def main() -> int:
             info = ydl.sanitize_info(info)
         result = {"ok": True, "info": info}
     except BaseException as exc:
-        # 写 stderr 供父进程记录，结果文件只放脱敏后的错误。
+        # 写 stderr 供父进程记录，结果文件只放截断后的错误。
         traceback.print_exc()
         result = {
             "ok": False,
-            "error": str(exc),
+            "error": str(exc)[:4000],
             "error_type": type(exc).__name__,
         }
 
     try:
-        result_path.write_text(
-            json.dumps(result, ensure_ascii=False, default=str), encoding="utf-8"
-        )
+        text = json.dumps(result, ensure_ascii=False, default=str)
+        if max_result_bytes > 0 and len(text.encode("utf-8")) > max_result_bytes:
+            text = json.dumps(
+                {
+                    "ok": False,
+                    "error": "yt-dlp 解析结果超过大小上限",
+                    "error_type": "ResultTooLarge",
+                },
+                ensure_ascii=False,
+            )
+        result_path.write_text(text, encoding="utf-8")
     except Exception as exc:
         print(f"写入 yt-dlp 结果失败：{exc}", file=sys.stderr)
         return 3

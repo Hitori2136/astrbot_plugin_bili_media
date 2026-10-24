@@ -102,9 +102,13 @@ class FakeService:
         self.audio_calls = 0
         self.video_calls = 0
         self.cookie = None
+        self.active_processes = set()
 
     def set_cookie(self, cookie):
         self.cookie = cookie
+
+    async def aclose(self):
+        self.active_processes.clear()
 
     async def probe(self, target):
         self.probe_calls += 1
@@ -166,7 +170,7 @@ class PluginTestBase(unittest.TestCase):
         self.addCleanup(self._convert_patcher.stop)
         self.plugins: list[bili.BiliMediaPlugin] = []
 
-    async def _fake_convert(self, source, target, ffmpeg, timeout=180):
+    async def _fake_convert(self, source, target, ffmpeg, timeout=180, **kwargs):
         shutil.copyfile(source, target)
         return target
 
