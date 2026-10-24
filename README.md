@@ -36,17 +36,29 @@ B 站视频 / 音频提取插件：发送 `/提取视频` 拿视频，发送 `/�
 
 ## 安装
 
-- 推荐：在 AstrBot WebUI → 插件 → 安装插件，上传 `dist/astrbot_plugin_bili_media-v1.1.0.zip`。
-- 或者把本目录放进 `data/plugins/`，重载插件。
+### 方式一：从 AstrBot 插件市场安装（推荐）
 
-插件依赖：
+1. 打开 AstrBot WebUI，进入 `插件` / `扩展管理` 页面；
+2. 切换到 `插件市场`（AstrBot Plugin Market）；
+3. 搜索 `astrbot_plugin_bili_media` 或 `B站视频/音频提取`；
+4. 点击 `安装`，安装完成后按提示重载插件；
+5. 插件依赖会依据 `requirements.txt` 自动安装。
 
-- `yt-dlp`：解析和下载 B 站视频；
-- `imageio-ffmpeg`：系统没有 ffmpeg 时提供兜底二进制；
-- `qrcode[pil]`：生成扫码登录二维码；
-- 系统 `ffmpeg`：有则优先使用，视频合并和音频转码都需要它。
+### 方式二：上传压缩包（无需 Git）
 
-B 站未登录通常只能取到 480P/360P。扫码登录或手动填写 `cookie` 后可以取更高清晰度。
+1. 从仓库的 Release 下载 `astrbot_plugin_bili_media-v1.0.0.zip`；
+2. 打开 AstrBot WebUI → `插件` → `安装插件` → 「上传压缩包」，选中该 zip；
+3. 安装完成后插件会自动加载，接着到插件配置里修改配置即可。
+
+### 方式三：克隆仓库
+
+```bash
+cd AstrBot/data/plugins
+git clone https://github.com/Hitori2136/astrbot_plugin_bili_media
+```
+
+然后在 WebUI 的 `插件` 页面点「重载插件」，或重启 AstrBot。
+插件会依据 `requirements.txt` 自动安装依赖。
 
 ## 配置
 
@@ -78,18 +90,9 @@ B 站未登录通常只能取到 480P/360P。扫码登录或手动填写 `cookie
 `max_audio_chunks` 的视频只发送前 N 段，并给出提示。
 
 > QQ 官方机器人的**视频**消息依赖 AstrBot 4.29+ 的 `qqofficial` 适配器；
-> 4.19 及更早的官方适配器只处理图片和语音。若使用旧版，请优先用 OneBot/NapCat，
+> 某些更早的官方适配器只处理图片和语音。若使用旧版，请优先用 OneBot/NapCat，
 > 或升级 AstrBot。音频消息在旧版上仍可发送。
 
-## 开发与测试
+## License
 
-```bash
-python -m unittest discover -s tests -v
-python scripts/build_zip.py
-```
-
-测试使用 `tests/astrbot/` 里的假 AstrBot 包，不需要启动 AstrBot，也不会消耗网络额度。
-
-## 许可证
-
-MIT
+MIT，详见 [LICENSE](LICENSE)。
