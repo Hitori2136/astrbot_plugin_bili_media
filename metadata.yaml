@@ -1,0 +1,12 @@
+name: astrbot_plugin_bili_media
+display_name: B站视频/音频提取
+desc: "发送 /提取视频 或 /提取音频 + B 站视频链接，机器人返回视频，或按 60 秒切片发送可点击的 QQ 语音消息。"
+short_desc: "B站视频与 QQ 语音条提取"
+version: v1.0.0
+author: Hitori2136
+repo: https://github.com/Hitori2136/astrbot_plugin_bili_media
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - qq_official_webhook

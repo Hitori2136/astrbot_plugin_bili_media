@@ -1,0 +1,86 @@
+{
+  "max_video_height": {
+    "description": "视频最大清晰度",
+    "type": "int",
+    "hint": "360-1080。默认 720；B 站未登录时通常只能取到 480P 或 360P。",
+    "default": 720
+  },
+  "max_video_mb": {
+    "description": "视频大小上限（MB）",
+    "type": "int",
+    "hint": "5-100。QQ 官方机器人超过 30MB 会降级为文件，默认 30 可保证两端都显示为视频。",
+    "default": 30
+  },
+  "audio_chunk_seconds": {
+    "description": "语音切片长度（秒）",
+    "type": "int",
+    "hint": "10-60。QQ 语音条最长 60 秒，默认 60。",
+    "default": 60
+  },
+  "max_audio_chunks": {
+    "description": "最多发送多少段语音",
+    "type": "int",
+    "hint": "1-120。超过后只发送前 N 段并提示，避免超长视频刷屏。",
+    "default": 30
+  },
+  "audio_send_interval": {
+    "description": "语音段发送间隔（秒）",
+    "type": "float",
+    "hint": "0-5。多段语音连续发送时的间隔，默认 0.6 秒。",
+    "default": 0.6
+  },
+  "send_progress": {
+    "description": "发送进度提示",
+    "type": "bool",
+    "hint": "解析出标题后先发一条“正在下载/提取”的提示。",
+    "default": true
+  },
+  "cooldown_seconds": {
+    "description": "单用户冷却时间（秒）",
+    "type": "int",
+    "hint": "0-600。0 表示不限制；默认 20 秒，防止连续刷屏。",
+    "default": 20
+  },
+  "max_concurrent": {
+    "description": "最大同时处理任务数",
+    "type": "int",
+    "hint": "1-3。下载和转码比较吃资源，默认 1。",
+    "default": 1
+  },
+  "timeout_seconds": {
+    "description": "单次处理超时（秒）",
+    "type": "int",
+    "hint": "30-900。包含解析和下载，默认 300。",
+    "default": 300
+  },
+  "max_audio_mb": {
+    "description": "音频源文件大小上限（MB）",
+    "type": "int",
+    "hint": "10-1000。只限制下载的原始音频，不是切片后的语音大小。",
+    "default": 200
+  },
+  "cookie": {
+    "description": "B 站 Cookie",
+    "type": "string",
+    "hint": "可只填 SESSDATA 的值，或完整写 SESSDATA=...; bili_jct=...。需要 720P/1080P 时建议填写。",
+    "default": ""
+  },
+  "cookies_file": {
+    "description": "B 站 cookies.txt 路径",
+    "type": "string",
+    "hint": "可选，Netscape 格式。cookie 配置项优先于本项。",
+    "default": ""
+  },
+  "proxy": {
+    "description": "下载代理",
+    "type": "string",
+    "hint": "例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7891；留空直连。",
+    "default": ""
+  },
+  "ffmpeg_path": {
+    "description": "ffmpeg 路径",
+    "type": "string",
+    "hint": "留空自动查找；找不到时会使用 imageio-ffmpeg 自带的二进制。",
+    "default": ""
+  }
+}
