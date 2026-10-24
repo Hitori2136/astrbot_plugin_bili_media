@@ -19,9 +19,15 @@ class PlatformAdapterType(enum.IntFlag):
     ALL = AIOCQHTTP | QQOFFICIAL | QQOFFICIAL_WEBHOOK
 
 
+class PermissionType(enum.IntFlag):
+    ADMIN = enum.auto()
+    MEMBER = enum.auto()
+
+
 class _Filter:
     EventMessageType = EventMessageType
     PlatformAdapterType = PlatformAdapterType
+    PermissionType = PermissionType
 
     def command(self, *args, **kwargs):
         return lambda func: func
@@ -33,6 +39,9 @@ class _Filter:
         return lambda func: func
 
     def event_message_type(self, *args, **kwargs):
+        return lambda func: func
+
+    def permission_type(self, *args, **kwargs):
         return lambda func: func
 
     def regex(self, *args, **kwargs):

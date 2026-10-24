@@ -62,7 +62,7 @@
   "cookie": {
     "description": "B 站 Cookie",
     "type": "string",
-    "hint": "可只填 SESSDATA 的值，或完整写 SESSDATA=...; bili_jct=...。需要 720P/1080P 时建议填写。",
+    "hint": "扫码登录优先；也可手动填 SESSDATA 的值，或完整写 SESSDATA=...; bili_jct=...。",
     "default": ""
   },
   "cookies_file": {

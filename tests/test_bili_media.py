@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import sys
 import tempfile
@@ -99,6 +100,10 @@ class FakeService:
         self.probe_calls = 0
         self.audio_calls = 0
         self.video_calls = 0
+        self.cookie = None
+
+    def set_cookie(self, cookie):
+        self.cookie = cookie
 
     async def probe(self, target):
         self.probe_calls += 1
@@ -121,6 +126,34 @@ class FakeService:
         path = Path(workdir) / "video.mp4"
         path.write_bytes(b"fake-mp4")
         return bili.DownloadedVideo(path=path, height=720, size_bytes=8)
+
+
+class FakeLoginClient:
+    def __init__(self, polls):
+        self.polls = list(polls)
+        self.generated = 0
+
+    async def generate(self):
+        self.generated += 1
+        return bili.QrCode(url="https://example.com/qr", qrcode_key="test-key")
+
+    async def poll(self, qrcode_key):
+        if self.polls:
+            return self.polls.pop(0)
+        return bili.QrPoll(
+            state=bili.QR_STATE_SUCCESS,
+            payload={"url": ""},
+            set_cookies=[
+                "SESSDATA=test-sessdata; Path=/; Domain=.bilibili.com",
+                "bili_jct=test-jct; Path=/",
+                "DedeUserID=1001; Path=/",
+            ],
+        )
+
+    async def fetch_nav(self, cookie):
+        return {"uname": "测试UP", "mid": 1001}
+
+    extract_cookie = staticmethod(bili.BiliLoginClient.extract_cookie)
 
 
 class PluginTestBase(unittest.TestCase):
@@ -148,6 +181,10 @@ class PluginTestBase(unittest.TestCase):
         plugin._ffmpeg = "ffmpeg"
         plugin.service = service or FakeService()
         plugin._schedule_cleanup = lambda path: None
+        plugin._data_dir_path = Path(
+            tempfile.mkdtemp(prefix="bili_credentials_")
+        )
+        plugin._credentials_loaded = True
         self.plugins.append(plugin)
         self.addCleanup(self._cleanup_plugin, plugin)
         return plugin
@@ -157,6 +194,8 @@ class PluginTestBase(unittest.TestCase):
             shutil.rmtree(path, ignore_errors=True)
         for task in list(plugin._cleanup_tasks):
             task.cancel()
+        if plugin._data_dir_path is not None:
+            shutil.rmtree(plugin._data_dir_path, ignore_errors=True)
 
     async def collect(self, plugin, event, url, audio):
         items = []
@@ -166,6 +205,24 @@ class PluginTestBase(unittest.TestCase):
 
     def run_handler(self, plugin, event, url, audio):
         return asyncio.run(self.collect(plugin, event, url, audio))
+
+    async def collect_login(self, plugin, event):
+        items = []
+        async for item in plugin.account_login(event):
+            items.append(item)
+        return items
+
+    async def collect_status(self, plugin, event):
+        items = []
+        async for item in plugin.account_status(event):
+            items.append(item)
+        return items
+
+    async def collect_logout(self, plugin, event):
+        items = []
+        async for item in plugin.account_logout(event):
+            items.append(item)
+        return items
 
 
 class UrlTests(unittest.TestCase):
@@ -378,6 +435,121 @@ class RedactTests(unittest.TestCase):
 
     def test_short_error_strips_ansi(self):
         self.assertEqual(bili._short_error("\x1b[31mERROR: boom\x1b[0m"), "boom")
+
+
+class LoginTests(PluginTestBase):
+    def setUp(self):
+        super().setUp()
+        self._qr_patcher = mock.patch.object(bili, "make_qr_png", new=self._fake_qr)
+        self._qr_patcher.start()
+        self.addCleanup(self._qr_patcher.stop)
+
+    @staticmethod
+    def _fake_qr(data, target):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"\x89PNG\r\n\x1a\n")
+        return target
+
+    def _success_poll(self):
+        return bili.QrPoll(
+            state=bili.QR_STATE_SUCCESS,
+            payload={"url": ""},
+            set_cookies=[
+                "SESSDATA=test-sessdata; Path=/; Domain=.bilibili.com",
+                "bili_jct=test-jct; Path=/",
+                "DedeUserID=1001; Path=/",
+            ],
+        )
+
+    def test_login_saves_credentials(self):
+        plugin = self.make_plugin()
+        plugin.login_client = FakeLoginClient([self._success_poll()])
+        event = FakeEvent()
+        items = asyncio.run(self.collect_login(plugin, event))
+
+        self.assertEqual(len(items), 2)
+        chain = items[0]["chain"]
+        self.assertEqual(len(chain), 2)
+        self.assertIn("二维码", chain[0].text)
+        self.assertTrue(Path(chain[1].path).is_file())
+        self.assertIn("登录成功", items[1]["text"])
+        self.assertIn("测试UP", items[1]["text"])
+        self.assertIs(event.llm, False)
+
+        path = plugin._data_dir_path / bili.CREDENTIALS_FILENAME
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIn("SESSDATA=test-sessdata", data["cookie"])
+        self.assertEqual(data["uid"], "1001")
+        self.assertEqual(plugin.service.cookie, data["cookie"])
+
+    def test_login_scanned_then_success(self):
+        plugin = self.make_plugin()
+        plugin.login_client = FakeLoginClient(
+            [
+                bili.QrPoll(bili.QR_STATE_SCANNED, {}, []),
+                self._success_poll(),
+            ]
+        )
+        items = asyncio.run(self.collect_login(plugin, FakeEvent()))
+        self.assertEqual(len(items), 3)
+        self.assertIn("已扫码", items[1]["text"])
+        self.assertIn("登录成功", items[2]["text"])
+
+    def test_login_expired(self):
+        plugin = self.make_plugin()
+        plugin.login_client = FakeLoginClient(
+            [bili.QrPoll(bili.QR_STATE_EXPIRED, {}, [])]
+        )
+        items = asyncio.run(self.collect_login(plugin, FakeEvent()))
+        self.assertEqual(len(items), 2)
+        self.assertIn("已过期", items[1]["text"])
+        self.assertFalse(
+            (plugin._data_dir_path / bili.CREDENTIALS_FILENAME).exists()
+        )
+
+    def test_status_and_logout(self):
+        plugin = self.make_plugin()
+        plugin.login_client = FakeLoginClient([self._success_poll()])
+        asyncio.run(self.collect_login(plugin, FakeEvent()))
+
+        status = asyncio.run(self.collect_status(plugin, FakeEvent()))
+        self.assertIn("测试UP", status[0]["text"])
+
+        logout = asyncio.run(self.collect_logout(plugin, FakeEvent()))
+        self.assertIn("已退出", logout[0]["text"])
+        self.assertIsNone(plugin.service.cookie)
+        self.assertFalse(
+            (plugin._data_dir_path / bili.CREDENTIALS_FILENAME).exists()
+        )
+
+    def test_stored_credentials_applied_on_first_use(self):
+        plugin = self.make_plugin()
+        path = plugin._data_dir_path / bili.CREDENTIALS_FILENAME
+        path.write_text(
+            json.dumps({"cookie": "SESSDATA=stored; bili_jct=x", "uid": "42"}),
+            encoding="utf-8",
+        )
+        plugin._credentials_loaded = False
+        plugin._ensure_credentials()
+        self.assertEqual(plugin.service.cookie, "SESSDATA=stored; bili_jct=x")
+
+    def test_extract_cookie_falls_back_to_url(self):
+        poll = bili.QrPoll(
+            state=0,
+            payload={
+                "url": "https://passport.biligame.com/crossDomain?"
+                "SESSDATA=from-url&bili_jct=jwt&DedeUserID=7"
+            },
+            set_cookies=[],
+        )
+        cookie = bili.BiliLoginClient.extract_cookie(poll)
+        self.assertIn("SESSDATA=from-url", cookie)
+        self.assertIn("DedeUserID=7", cookie)
+
+    def test_extract_cookie_without_sessdata_fails(self):
+        poll = bili.QrPoll(state=0, payload={}, set_cookies=["foo=bar"])
+        with self.assertRaises(bili.UserVisibleError):
+            bili.BiliLoginClient.extract_cookie(poll)
 
 
 class HandlerTests(PluginTestBase):

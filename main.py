@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 import re
@@ -27,12 +28,13 @@ import urllib.parse
 import urllib.request
 import wave
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Record, Video
+from astrbot.api.message_components import Image, Plain, Record, Video
 from astrbot.api.star import Context, Star
 
 PLUGIN_NAME = "astrbot_plugin_bili_media"
@@ -41,6 +43,18 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 BILI_REFERER = "https://www.bilibili.com/"
+BILI_QR_GENERATE_URL = (
+    "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
+)
+BILI_QR_POLL_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
+BILI_NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
+QR_LOGIN_TIMEOUT = 180.0
+QR_POLL_INTERVAL = 2.0
+QR_STATE_SUCCESS = 0
+QR_STATE_EXPIRED = 86038
+QR_STATE_SCANNED = 86090
+QR_STATE_NOT_SCANNED = 86101
+CREDENTIALS_FILENAME = "credentials.json"
 DEFAULT_TIMEOUT = 300
 MAX_ERROR_CHARS = 160
 
@@ -140,6 +154,34 @@ class AudioChunks:
     duration: float
     total_chunks: int
     truncated: bool
+
+
+@dataclass
+class QrCode:
+    url: str
+    qrcode_key: str
+
+
+@dataclass
+class QrPoll:
+    state: int
+    payload: dict[str, Any]
+    set_cookies: list[str]
+
+
+# 只保留登录需要且适合写进 Cookie 头的字段，避免把 gourl 等参数带进去。
+_COOKIE_NAMES = (
+    "SESSDATA",
+    "bili_jct",
+    "DedeUserID",
+    "DedeUserID__ckMd5",
+    "sid",
+    "buvid3",
+    "buvid4",
+    "buvid_fp",
+    "buvid_fp_plain",
+    "b_nut",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -835,9 +877,14 @@ class BiliService:
     def __init__(self, settings: PluginSettings, ffmpeg: str | None = None):
         self.settings = settings
         self.ffmpeg = ffmpeg
+        # 扫码登录得到的 Cookie 优先于配置里的 cookie / cookies_file。
+        self.cookie: str | None = None
 
     def set_ffmpeg(self, ffmpeg: str) -> None:
         self.ffmpeg = ffmpeg
+
+    def set_cookie(self, cookie: str | None) -> None:
+        self.cookie = str(cookie).strip() if cookie else None
 
     def _base_opts(self, outdir: Path) -> dict[str, Any]:
         opts: dict[str, Any] = {
@@ -869,10 +916,11 @@ class BiliService:
         }
         if self.ffmpeg:
             opts["ffmpeg_location"] = self.ffmpeg
-        if self.settings.cookies_file:
+        cookie = self.cookie or self.settings.cookie
+        if cookie:
+            opts["http_headers"]["Cookie"] = cookie
+        elif self.settings.cookies_file:
             opts["cookiefile"] = self.settings.cookies_file
-        if self.settings.cookie:
-            opts["http_headers"]["Cookie"] = self.settings.cookie
         if self.settings.proxy:
             opts["proxy"] = self.settings.proxy
         return opts
@@ -1009,6 +1057,162 @@ class BiliService:
 
 
 # --------------------------------------------------------------------------- #
+# B 站扫码登录
+# --------------------------------------------------------------------------- #
+def _login_headers(cookie: str | None = None) -> dict[str, str]:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": BILI_REFERER,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+
+def _http_json_sync(
+    url: str, headers: dict[str, str], timeout: float
+) -> tuple[dict[str, Any], list[str]]:
+    request = urllib.request.Request(url, headers=headers, method="GET")  # noqa: S310
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            raw = response.read()
+            set_cookies = response.headers.get_all("Set-Cookie") or []
+    except urllib.error.HTTPError as exc:
+        detail = _short_error(exc.read().decode("utf-8", "replace"))
+        raise UserVisibleError(
+            f"B 站登录接口返回 HTTP {exc.code}"
+            + (f"：{detail}" if detail else "")
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise UserVisibleError("无法连接 B 站登录服务，请检查网络或代理。") from exc
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise UserVisibleError("B 站登录接口返回了无法解析的数据。") from exc
+    if not isinstance(payload, dict):
+        raise UserVisibleError("B 站登录接口返回格式异常。")
+    return payload, list(set_cookies)
+
+
+class BiliLoginClient:
+    """B 站 Web 扫码登录接口的轻量客户端。"""
+
+    def __init__(self, timeout: float = 20.0):
+        self.timeout = max(5.0, min(float(timeout), 60.0))
+
+    async def _get_json(
+        self, url: str, cookie: str | None = None
+    ) -> tuple[dict[str, Any], list[str]]:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    _http_json_sync, url, _login_headers(cookie), self.timeout
+                ),
+                timeout=self.timeout + 5,
+            )
+        except asyncio.TimeoutError as exc:
+            raise UserVisibleError("B 站登录接口超时，请检查网络或稍后重试。") from exc
+
+    async def generate(self) -> QrCode:
+        payload, _ = await self._get_json(BILI_QR_GENERATE_URL)
+        if payload.get("code") != 0:
+            raise UserVisibleError(
+                "生成 B 站登录二维码失败："
+                f"{payload.get('message') or payload.get('code')}"
+            )
+        data = payload.get("data") or {}
+        url = str(data.get("url") or "").strip()
+        key = str(data.get("qrcode_key") or "").strip()
+        if not url or not key:
+            raise UserVisibleError("生成 B 站登录二维码失败：返回数据不完整。")
+        return QrCode(url=url, qrcode_key=key)
+
+    async def poll(self, qrcode_key: str) -> QrPoll:
+        query = urllib.parse.urlencode(
+            {"qrcode_key": qrcode_key, "source": "main-fe-header"}
+        )
+        payload, set_cookies = await self._get_json(
+            f"{BILI_QR_POLL_URL}?{query}"
+        )
+        if payload.get("code") != 0:
+            raise UserVisibleError(
+                "查询扫码状态失败："
+                f"{payload.get('message') or payload.get('code')}"
+            )
+        data = payload.get("data") or {}
+        try:
+            state = int(data.get("code") if data.get("code") is not None else -1)
+        except (TypeError, ValueError):
+            state = -1
+        return QrPoll(state=state, payload=data, set_cookies=set_cookies)
+
+    async def fetch_nav(self, cookie: str) -> dict[str, Any]:
+        try:
+            payload, _ = await self._get_json(BILI_NAV_URL, cookie=cookie)
+        except Exception:
+            return {}
+        if payload.get("code") == 0 and isinstance(payload.get("data"), dict):
+            data = payload["data"]
+            if data.get("isLogin"):
+                return data
+        return {}
+
+    @staticmethod
+    def extract_cookie(poll: QrPoll) -> str:
+        """优先从 Set-Cookie 提取，失败时回退到 data.url 的查询参数。"""
+        jar: dict[str, str] = {}
+        for header in poll.set_cookies:
+            first = str(header).split(";", 1)[0]
+            name, separator, value = first.partition("=")
+            name = name.strip()
+            if separator and name in _COOKIE_NAMES and value.strip():
+                jar[name] = value.strip()
+
+        if "SESSDATA" not in jar:
+            login_url = str(poll.payload.get("url") or "")
+            query = urllib.parse.urlsplit(login_url).query
+            for item in query.split("&"):
+                name, separator, value = item.partition("=")
+                name = urllib.parse.unquote(name)
+                if separator and name in _COOKIE_NAMES and name not in jar:
+                    jar[name] = value.strip()
+
+        if not jar.get("SESSDATA"):
+            raise UserVisibleError(
+                "扫码已确认，但没有拿到 SESSDATA。请重新发送 /账号登陆。"
+            )
+        return "; ".join(f"{name}={jar[name]}" for name in _COOKIE_NAMES if name in jar)
+
+
+def make_qr_png(data: str, target: Path) -> Path:
+    try:
+        import qrcode
+    except ImportError as exc:
+        raise MissingDependencyError(
+            "缺少 qrcode 依赖，无法生成登录二维码。请重载插件安装 requirements.txt。"
+        ) from exc
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=8,
+            border=2,
+        )
+        qr.add_data(data)
+        qr.make(fit=True)
+        image = qr.make_image(fill_color="black", back_color="white")
+        image.save(str(target))
+    except Exception as exc:
+        raise UserVisibleError(f"生成登录二维码图片失败：{_short_error(exc)}") from exc
+    return target
+
+
+# --------------------------------------------------------------------------- #
 # 消息组件兼容层
 # --------------------------------------------------------------------------- #
 def _make_video_component(path: Path) -> Video:
@@ -1023,6 +1227,13 @@ def _make_record_component(path: Path) -> Record:
     if callable(factory):
         return factory(str(path))
     return Record(file=str(path), path=str(path))
+
+
+def _make_image_component(path: Path) -> Image:
+    factory = getattr(Image, "fromFileSystem", None)
+    if callable(factory):
+        return factory(str(path))
+    return Image(file=str(path), path=str(path))
 
 
 # --------------------------------------------------------------------------- #
@@ -1052,6 +1263,11 @@ class BiliMediaPlugin(Star):
         self._tmp_dirs: set[Path] = set()
         self._cleanup_tasks: set[asyncio.Task] = set()
         self._cleanup_delay = self.settings.cleanup_delay_seconds
+        self.login_client = BiliLoginClient(self.settings.timeout_seconds)
+        self._login_lock = asyncio.Lock()
+        self._data_dir_path: Path | None = None
+        self._stored_credentials: dict[str, Any] | None = None
+        self._credentials_loaded = False
 
     # ---------------------------- 指令入口 ---------------------------- #
     @filter.command("提取视频")
@@ -1065,6 +1281,154 @@ class BiliMediaPlugin(Star):
     async def extract_audio(self, event: AstrMessageEvent, url: str = ""):
         async for result in self._handle_media(event, url, want_audio=True):
             yield result
+
+    # ---------------------------- 扫码登录 ---------------------------- #
+    @filter.command("账号登陆", alias={"账号登录"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.platform_adapter_type(_SUPPORTED_PLATFORMS)
+    async def account_login(self, event: AstrMessageEvent):
+        self._block_llm(event)
+
+        if self._login_lock.locked():
+            yield event.plain_result(
+                "已有扫码登录流程正在进行，请先完成或等待它过期，再重新发送 /账号登陆。"
+            )
+            return
+        await self._login_lock.acquire()
+
+        workdir: Path | None = None
+        try:
+            self._ensure_credentials()
+            current = self._stored_credentials or {}
+            caption = (
+                "请用哔哩哔哩 App 扫描二维码，并在手机上确认登录。\n"
+                "二维码 3 分钟内有效；确认后机器人会自动保存凭据。"
+            )
+            if current:
+                caption += (
+                    f"\n当前已登录：{self._credential_name(current)}，"
+                    "扫码成功后会替换为新的账号。"
+                )
+
+            qr = await self.login_client.generate()
+            workdir = Path(tempfile.mkdtemp(prefix="astrbot_bili_login_"))
+            self._tmp_dirs.add(workdir)
+            qr_path = workdir / "login_qr.png"
+            await asyncio.to_thread(make_qr_png, qr.url, qr_path)
+            yield event.chain_result(
+                [Plain(caption), _make_image_component(qr_path)]
+            )
+
+            deadline = time.monotonic() + QR_LOGIN_TIMEOUT
+            scanned_notified = False
+            consecutive_errors = 0
+            while time.monotonic() < deadline:
+                try:
+                    poll = await self.login_client.poll(qr.qrcode_key)
+                    consecutive_errors = 0
+                except UserVisibleError as exc:
+                    consecutive_errors += 1
+                    if consecutive_errors >= 3:
+                        yield event.plain_result(str(exc))
+                        return
+                    await asyncio.sleep(QR_POLL_INTERVAL)
+                    continue
+
+                if poll.state == QR_STATE_SUCCESS:
+                    cookie = self.login_client.extract_cookie(poll)
+                    nav = await self.login_client.fetch_nav(cookie)
+                    uid = self._cookie_value(cookie, "DedeUserID") or str(
+                        nav.get("mid") or ""
+                    )
+                    nickname = str(nav.get("uname") or "B站账号")
+                    saved = self._save_credentials(cookie, uid, nickname)
+                    self.service.set_cookie(cookie)
+                    text = f"B 站账号登录成功：{nickname}"
+                    if uid:
+                        text += f"（UID {uid}）"
+                    text += "\n后续 /提取视频、/提取音频 会自动使用该账号。"
+                    if not saved:
+                        text += "\n警告：登录成功，但凭据写入失败，重启插件后需要重新扫码。"
+                    yield event.plain_result(text)
+                    return
+
+                if poll.state == QR_STATE_EXPIRED:
+                    yield event.plain_result(
+                        "二维码已过期，请重新发送 /账号登陆 获取新的二维码。"
+                    )
+                    return
+
+                if poll.state == QR_STATE_SCANNED and not scanned_notified:
+                    scanned_notified = True
+                    yield event.plain_result(
+                        "已扫码，请在手机 B 站上点击确认登录。"
+                    )
+
+                await asyncio.sleep(QR_POLL_INTERVAL)
+
+            yield event.plain_result(
+                "二维码已过期（3 分钟），请重新发送 /账号登陆。"
+            )
+
+        except UserVisibleError as exc:
+            yield event.plain_result(str(exc))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("B站扫码登录出现未预期错误", exc_info=True)
+            yield event.plain_result("扫码登录失败，请稍后重试。详情已写入日志。")
+        finally:
+            if workdir is not None:
+                # 不要立即删除：框架可能在 yield 之后才读取图片；延迟清理。
+                self._schedule_cleanup(workdir)
+            self._login_lock.release()
+
+    @filter.command("账号状态", alias={"登录状态"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.platform_adapter_type(_SUPPORTED_PLATFORMS)
+    async def account_status(self, event: AstrMessageEvent):
+        self._block_llm(event)
+        self._ensure_credentials()
+        if self._stored_credentials:
+            updated = self._format_time(self._stored_credentials.get("updated_at"))
+            yield event.plain_result(
+                "当前使用扫码登录的 B 站账号："
+                f"{self._credential_name(self._stored_credentials)}"
+                + (f"\n更新时间：{updated}" if updated else "")
+                + "\n发送 /账号登陆 可更换账号，发送 /退出登陆 可清除。"
+            )
+            return
+        if self.settings.cookie or self.settings.cookies_file:
+            yield event.plain_result(
+                "当前使用插件配置里的 B 站 Cookie（不是扫码登录）。\n"
+                "发送 /账号登陆 可改用扫码账号。"
+            )
+            return
+        yield event.plain_result(
+            "尚未登录 B 站。发送 /账号登陆，用哔哩哔哩 App 扫码即可。"
+        )
+
+    @filter.command("退出登陆", alias={"退出登录"})
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.platform_adapter_type(_SUPPORTED_PLATFORMS)
+    async def account_logout(self, event: AstrMessageEvent):
+        self._block_llm(event)
+        self._ensure_credentials()
+        had_credentials = self._stored_credentials is not None
+        removed = self._delete_credentials()
+        if not removed:
+            yield event.plain_result("清除扫码凭据失败，请查看日志后重试。")
+            return
+        self.service.set_cookie(None)
+        if had_credentials:
+            text = "已退出扫码登录的 B 站账号。"
+        else:
+            text = "当前没有扫码登录的 B 站账号。"
+        if self.settings.cookie or self.settings.cookies_file:
+            text += "\n仍会使用插件配置里的 Cookie 作为兜底。"
+        else:
+            text += "\n如需重新登录，请发送 /账号登陆。"
+        yield event.plain_result(text)
 
     # ---------------------------- 主流程 ------------------------------ #
     async def _handle_media(
@@ -1104,6 +1468,7 @@ class BiliMediaPlugin(Star):
             workdir = Path(tempfile.mkdtemp(prefix="astrbot_bili_media_"))
             self._tmp_dirs.add(workdir)
             ffmpeg = self._ensure_ffmpeg()
+            self._ensure_credentials()
 
             meta = await self.service.probe(target)
             if self.settings.send_progress:
@@ -1160,6 +1525,115 @@ class BiliMediaPlugin(Star):
                     self._rmtree(workdir)
 
     # ---------------------------- 辅助 -------------------------------- #
+    def _ensure_credentials(self) -> None:
+        if self._credentials_loaded:
+            return
+        self._credentials_loaded = True
+        data = self._load_credentials()
+        self._stored_credentials = data
+        if data and data.get("cookie"):
+            self.service.set_cookie(str(data["cookie"]))
+
+    def _data_dir(self, create: bool = False) -> Path:
+        if self._data_dir_path is None:
+            try:
+                try:
+                    from astrbot.api.star import StarTools
+                except ImportError:
+                    from astrbot.core.star.star_tools import StarTools
+
+                path = Path(StarTools.get_data_dir(PLUGIN_NAME))
+            except Exception as exc:
+                logger.debug("无法获取插件数据目录，使用回退路径：%s", redact(exc))
+                path = Path("data/plugin_data") / PLUGIN_NAME
+            self._data_dir_path = path
+        if create:
+            self._data_dir_path.mkdir(parents=True, exist_ok=True)
+        return self._data_dir_path
+
+    def _credentials_path(self, create: bool = False) -> Path:
+        return self._data_dir(create=create) / CREDENTIALS_FILENAME
+
+    def _load_credentials(self) -> dict[str, Any] | None:
+        path = self._credentials_path(create=False)
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            logger.warning("读取 B 站扫码凭据失败：%s", redact(exc))
+            return None
+        if not isinstance(data, dict):
+            logger.warning("B 站扫码凭据格式错误，已忽略。")
+            return None
+        cookie = str(data.get("cookie") or "").strip()
+        if not cookie:
+            logger.warning("B 站扫码凭据缺少 cookie，已忽略。")
+            return None
+        data["cookie"] = cookie
+        return data
+
+    def _save_credentials(self, cookie: str, uid: str, nickname: str) -> bool:
+        path = self._credentials_path(create=True)
+        payload = {
+            "cookie": cookie,
+            "uid": str(uid or ""),
+            "nickname": str(nickname or ""),
+            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "source": "qrcode",
+        }
+        self._stored_credentials = payload
+        self._credentials_loaded = True
+        try:
+            text = json.dumps(payload, ensure_ascii=False, indent=2)
+            temporary = path.with_name(path.name + ".tmp")
+            temporary.write_text(text, encoding="utf-8")
+            if os.name != "nt":
+                os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+            return True
+        except OSError as exc:
+            logger.error("保存 B 站扫码凭据失败：%s", redact(exc))
+            return False
+
+    def _delete_credentials(self) -> bool:
+        path = self._credentials_path(create=False)
+        try:
+            if path.is_file():
+                path.unlink()
+        except OSError as exc:
+            logger.error("删除 B 站扫码凭据失败：%s", redact(exc))
+            return False
+        self._stored_credentials = None
+        self._credentials_loaded = True
+        return True
+
+    @staticmethod
+    def _credential_name(data: dict[str, Any]) -> str:
+        nickname = str(data.get("nickname") or "").strip()
+        uid = str(data.get("uid") or "").strip()
+        if nickname and uid:
+            return f"{nickname}（UID {uid}）"
+        return nickname or (f"UID {uid}" if uid else "B站账号")
+
+    @staticmethod
+    def _cookie_value(cookie: str, name: str) -> str:
+        for item in str(cookie or "").split(";"):
+            key, separator, value = item.strip().partition("=")
+            if separator and key == name:
+                return value.strip()
+        return ""
+
+    @staticmethod
+    def _format_time(value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            return datetime.fromisoformat(text).strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            return text
+
     def _ensure_ffmpeg(self) -> str:
         if self._ffmpeg is None:
             self._ffmpeg = resolve_ffmpeg(self.settings.ffmpeg_path)

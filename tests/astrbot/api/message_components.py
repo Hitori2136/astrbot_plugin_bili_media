@@ -23,5 +23,12 @@ class Video(_Component):
         return cls(file=Path(path).absolute().as_uri(), path=str(path), **kwargs)
 
 
+class Image(_Component):
+    @classmethod
+    def fromFileSystem(cls, path, **kwargs):
+        return cls(file=Path(path).absolute().as_uri(), path=str(path), **kwargs)
+
+
 class Plain(_Component):
-    pass
+    def __init__(self, text="", **kwargs):
+        super().__init__(text=text, **kwargs)
