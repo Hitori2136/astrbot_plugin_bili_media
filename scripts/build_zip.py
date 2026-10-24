@@ -19,6 +19,7 @@ DIST = ROOT / "dist"
 FILES = [
     "metadata.yaml",
     "main.py",
+    "bili_ytdlp_worker.py",
     "_conf_schema.json",
     "requirements.txt",
     "README.md",

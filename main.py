@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -59,7 +60,7 @@ DEFAULT_TIMEOUT = 300
 MAX_ERROR_CHARS = 160
 
 _URL_RE = re.compile(r"https?://[^\s<>'\"）)】\]]+", re.IGNORECASE)
-_BV_RE = re.compile(r"(?<![0-9A-Za-z])BV[0-9A-Za-z]{10}(?![0-9A-Za-z])", re.IGNORECASE)
+_BV_RE = re.compile(r"(?<![0-9A-Za-z])BV[0-9A-Za-z]{10}(?![0-9A-Za-z])")
 _AV_RE = re.compile(r"(?<![0-9A-Za-z])av\d+(?![0-9A-Za-z])", re.IGNORECASE)
 _B23_RE = re.compile(
     r"(?<![0-9A-Za-z.])(?:www\.)?b23\.tv/[A-Za-z0-9]+", re.IGNORECASE
@@ -255,9 +256,10 @@ def _extract_url_token(text: str) -> str:
 
 
 def _video_id_from_segment(segment: str) -> str | None:
-    match = re.fullmatch(r"BV([0-9A-Za-z]{10})", segment, re.IGNORECASE)
+    # BVID 区分大小写，必须原样保留，不能做 IGNORECASE + 重新拼接。
+    match = re.fullmatch(r"BV[0-9A-Za-z]{10}", segment)
     if match:
-        return "BV" + match.group(1)
+        return match.group(0)
     match = re.fullmatch(r"av(\d+)", segment, re.IGNORECASE)
     if match:
         return "av" + match.group(1)
@@ -414,6 +416,8 @@ class PluginSettings:
     max_video_height: int = 720
     max_video_mb: int = 30
     max_audio_mb: int = 200
+    max_download_mb: int = 500
+    max_parse_mb: int = 16
     audio_chunk_seconds: int = 60
     max_audio_chunks: int = 30
     audio_send_interval: float = 0.6
@@ -434,6 +438,14 @@ class PluginSettings:
     @property
     def max_audio_bytes(self) -> int:
         return self.max_audio_mb * 1024 * 1024
+
+    @property
+    def max_download_bytes(self) -> int:
+        return self.max_download_mb * 1024 * 1024
+
+    @property
+    def max_parse_bytes(self) -> int:
+        return self.max_parse_mb * 1024 * 1024
 
     @classmethod
     def from_config(cls, raw: dict | None) -> PluginSettings:
@@ -460,6 +472,10 @@ class PluginSettings:
             max_video_height=_as_int(get("max_video_height", 720), 720, 144, 2160),
             max_video_mb=_as_int(get("max_video_mb", 30), 30, 1, 500),
             max_audio_mb=_as_int(get("max_audio_mb", 200), 200, 10, 1000),
+            max_download_mb=_as_int(
+                get("max_download_mb", 500), 500, 10, 2048
+            ),
+            max_parse_mb=_as_int(get("max_parse_mb", 16), 16, 1, 128),
             audio_chunk_seconds=_as_int(
                 get("audio_chunk_seconds", 60), 60, 1, 60
             ),
@@ -871,6 +887,23 @@ def _is_retryable_video_error(exc: BaseException) -> bool:
     )
 
 
+def _read_text_tail(path: Path, limit: int = 8192) -> str:
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - limit))
+            return handle.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _write_private_text(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+    if os.name != "nt":
+        os.chmod(path, 0o600)
+
+
 class BiliService:
     """把 yt-dlp 的同步调用包在 asyncio.to_thread 里。"""
 
@@ -879,6 +912,9 @@ class BiliService:
         self.ffmpeg = ffmpeg
         # 扫码登录得到的 Cookie 优先于配置里的 cookie / cookies_file。
         self.cookie: str | None = None
+        self.worker_path = Path(__file__).resolve().with_name(
+            "bili_ytdlp_worker.py"
+        )
 
     def set_ffmpeg(self, ffmpeg: str) -> None:
         self.ffmpeg = ffmpeg
@@ -913,6 +949,7 @@ class BiliService:
             "geo_bypass": True,
             "ignoreerrors": False,
             "extract_flat": False,
+            "max_filesize": self.settings.max_download_bytes,
         }
         if self.ffmpeg:
             opts["ffmpeg_location"] = self.ffmpeg
@@ -928,31 +965,109 @@ class BiliService:
     async def _extract(
         self, url: str, opts: dict[str, Any], download: bool
     ) -> dict[str, Any]:
-        def run() -> dict[str, Any]:
-            try:
-                import yt_dlp
-            except ImportError as exc:
-                raise MissingDependencyError(
-                    "缺少 yt-dlp 依赖。请重载插件让 AstrBot 自动安装 requirements.txt，"
-                    "或手动执行 pip install yt-dlp。"
-                ) from exc
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=download)
-
-        try:
-            info = await asyncio.wait_for(
-                asyncio.to_thread(run), timeout=self.settings.timeout_seconds
+        """在独立子进程中运行 yt-dlp，超时可以真正 kill 掉。"""
+        worker = self.worker_path
+        if not worker.is_file():
+            raise MissingDependencyError(
+                "缺少 bili_ytdlp_worker.py，无法启动 yt-dlp 处理进程。"
             )
-        except asyncio.TimeoutError as exc:
-            raise DownloadFailedError("处理超时，请稍后重试或换更短的视频。") from exc
-        except UserVisibleError:
-            raise
-        except Exception as exc:
-            raise map_download_error(exc) from exc
+        if not sys.executable:
+            raise MissingDependencyError("当前运行环境没有可用的 Python 解释器。")
 
-        if not isinstance(info, dict):
-            raise DownloadFailedError("解析失败：yt-dlp 没有返回视频信息。")
-        return info
+        workdir = Path(tempfile.mkdtemp(prefix="astrbot_bili_ytdlp_"))
+        request_path = workdir / "request.json"
+        result_path = workdir / "result.json"
+        log_path = workdir / "ytdlp.log"
+        try:
+            clean_opts = dict(opts)
+            clean_opts.pop("logger", None)
+            clean_opts.pop("progress_hooks", None)
+            payload = {"url": url, "opts": clean_opts, "download": download}
+            try:
+                request_text = json.dumps(payload, ensure_ascii=False)
+            except (TypeError, ValueError) as exc:
+                raise DownloadFailedError("yt-dlp 参数无法序列化。") from exc
+            _write_private_text(request_path, request_text)
+
+            command = [
+                sys.executable,
+                "-u",
+                str(worker),
+                str(request_path),
+                str(result_path),
+            ]
+            popen_kwargs: dict[str, Any] = {
+                "stdout": subprocess.DEVNULL,
+                "cwd": str(workdir),
+            }
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = getattr(
+                    subprocess, "CREATE_NO_WINDOW", 0
+                )
+
+            with open(log_path, "wb") as log_file:
+                try:
+                    process = await asyncio.create_subprocess_exec(
+                        *command, stderr=log_file, **popen_kwargs
+                    )
+                except (OSError, ValueError) as exc:
+                    raise MissingDependencyError(
+                        "无法启动 yt-dlp 子进程，请检查 Python 环境。"
+                    ) from exc
+
+                try:
+                    await asyncio.wait_for(
+                        process.wait(), timeout=self.settings.timeout_seconds
+                    )
+                except asyncio.TimeoutError as exc:
+                    process.kill()
+                    await process.wait()
+                    raise DownloadFailedError(
+                        "处理超时，已终止 yt-dlp 子进程。请换更短的视频或稍后重试。"
+                    ) from exc
+
+            result: dict[str, Any] | None = None
+            if result_path.is_file():
+                try:
+                    if result_path.stat().st_size > self.settings.max_parse_bytes:
+                        raise DownloadFailedError(
+                            f"yt-dlp 解析结果超过 {self.settings.max_parse_mb}MB 上限。"
+                        )
+                    parsed = json.loads(result_path.read_text(encoding="utf-8"))
+                    if isinstance(parsed, dict):
+                        result = parsed
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    logger.warning("读取 yt-dlp 结果失败：%s", redact(exc))
+
+            if result and not result.get("ok"):
+                error = str(result.get("error") or "").strip()
+                if result.get("error_type") == "ModuleNotFoundError":
+                    raise MissingDependencyError(
+                        "当前子进程缺少 yt-dlp 依赖，请重载插件安装 requirements.txt。"
+                    )
+                raise map_download_error(Exception(error or "yt-dlp 执行失败"))
+
+            if process.returncode != 0:
+                log_tail = _short_error(_read_text_tail(log_path))
+                logger.warning(
+                    "yt-dlp 子进程退出码 %s：%s",
+                    process.returncode,
+                    log_tail or "无日志",
+                )
+                raise DownloadFailedError(
+                    "yt-dlp 子进程异常退出，详情已写入日志。"
+                )
+
+            if not result:
+                raise DownloadFailedError("yt-dlp 没有返回可解析的结果。")
+
+            info = result.get("info")
+            if not isinstance(info, dict):
+                raise DownloadFailedError("解析失败：yt-dlp 返回的数据格式异常。")
+            return info
+
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
 
     async def _unwrap_info(self, info: dict[str, Any], page: int) -> dict[str, Any]:
         if info.get("_type") not in {"playlist", "multi_video"}:
@@ -1008,6 +1123,10 @@ class BiliService:
                     raise DownloadFailedError("下载完成但没有找到视频文件。")
                 size = path.stat().st_size
                 last_size = size
+                if size > self.settings.max_download_bytes:
+                    raise MediaTooLargeError(
+                        f"视频文件超过下载上限 {self.settings.max_download_mb}MB。"
+                    )
                 if size <= self.settings.max_video_bytes:
                     return DownloadedVideo(path=path, height=choice.height, size_bytes=size)
                 logger.info(
@@ -1049,6 +1168,10 @@ class BiliService:
         )
         if path is None:
             raise DownloadFailedError("下载完成但没有找到音频文件。")
+        if path.stat().st_size > self.settings.max_download_bytes:
+            raise MediaTooLargeError(
+                f"音频源文件超过下载上限 {self.settings.max_download_mb}MB。"
+            )
         if path.stat().st_size > self.settings.max_audio_bytes:
             raise MediaTooLargeError(
                 f"音频源文件超过 {self.settings.max_audio_mb}MB 上限。"
@@ -1072,15 +1195,24 @@ def _login_headers(cookie: str | None = None) -> dict[str, str]:
 
 
 def _http_json_sync(
-    url: str, headers: dict[str, str], timeout: float
+    url: str,
+    headers: dict[str, str],
+    timeout: float,
+    max_bytes: int,
 ) -> tuple[dict[str, Any], list[str]]:
     request = urllib.request.Request(url, headers=headers, method="GET")  # noqa: S310
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
-            raw = response.read()
+            raw = response.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise UserVisibleError(
+                    f"B 站登录接口响应超过 {max_bytes // (1024 * 1024)}MB 上限。"
+                )
             set_cookies = response.headers.get_all("Set-Cookie") or []
     except urllib.error.HTTPError as exc:
-        detail = _short_error(exc.read().decode("utf-8", "replace"))
+        detail = _short_error(
+            exc.read(max_bytes + 1).decode("utf-8", "replace")
+        )
         raise UserVisibleError(
             f"B 站登录接口返回 HTTP {exc.code}"
             + (f"：{detail}" if detail else "")
@@ -1100,8 +1232,11 @@ def _http_json_sync(
 class BiliLoginClient:
     """B 站 Web 扫码登录接口的轻量客户端。"""
 
-    def __init__(self, timeout: float = 20.0):
+    def __init__(
+        self, timeout: float = 20.0, max_response_bytes: int = 16 * 1024 * 1024
+    ):
         self.timeout = max(5.0, min(float(timeout), 60.0))
+        self.max_response_bytes = max(1024, int(max_response_bytes))
 
     async def _get_json(
         self, url: str, cookie: str | None = None
@@ -1109,7 +1244,11 @@ class BiliLoginClient:
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(
-                    _http_json_sync, url, _login_headers(cookie), self.timeout
+                    _http_json_sync,
+                    url,
+                    _login_headers(cookie),
+                    self.timeout,
+                    self.max_response_bytes,
                 ),
                 timeout=self.timeout + 5,
             )
@@ -1178,7 +1317,9 @@ class BiliLoginClient:
                 name, separator, value = item.partition("=")
                 name = urllib.parse.unquote(name)
                 if separator and name in _COOKIE_NAMES and name not in jar:
-                    jar[name] = value.strip()
+                    # data.url 是 application/x-www-form-urlencoded，
+                    # 值需要解码后再写进 Cookie 头。
+                    jar[name] = urllib.parse.unquote(value.strip())
 
         if not jar.get("SESSDATA"):
             raise UserVisibleError(
@@ -1263,7 +1404,9 @@ class BiliMediaPlugin(Star):
         self._tmp_dirs: set[Path] = set()
         self._cleanup_tasks: set[asyncio.Task] = set()
         self._cleanup_delay = self.settings.cleanup_delay_seconds
-        self.login_client = BiliLoginClient(self.settings.timeout_seconds)
+        self.login_client = BiliLoginClient(
+            self.settings.timeout_seconds, self.settings.max_parse_bytes
+        )
         self._login_lock = asyncio.Lock()
         self._data_dir_path: Path | None = None
         self._stored_credentials: dict[str, Any] | None = None
@@ -1467,7 +1610,7 @@ class BiliMediaPlugin(Star):
 
             workdir = Path(tempfile.mkdtemp(prefix="astrbot_bili_media_"))
             self._tmp_dirs.add(workdir)
-            ffmpeg = self._ensure_ffmpeg()
+            ffmpeg = await self._ensure_ffmpeg()
             self._ensure_credentials()
 
             meta = await self.service.probe(target)
@@ -1559,6 +1702,12 @@ class BiliMediaPlugin(Star):
         if not path.is_file():
             return None
         try:
+            if path.stat().st_size > self.settings.max_parse_bytes:
+                logger.warning(
+                    "B 站扫码凭据文件超过解析上限 %sMB，已忽略。",
+                    self.settings.max_parse_mb,
+                )
+                return None
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             logger.warning("读取 B 站扫码凭据失败：%s", redact(exc))
@@ -1634,9 +1783,12 @@ class BiliMediaPlugin(Star):
         except ValueError:
             return text
 
-    def _ensure_ffmpeg(self) -> str:
+    async def _ensure_ffmpeg(self) -> str:
         if self._ffmpeg is None:
-            self._ffmpeg = resolve_ffmpeg(self.settings.ffmpeg_path)
+            # imageio-ffmpeg 首次解析/解压二进制可能阻塞，不能放在事件循环里。
+            self._ffmpeg = await asyncio.to_thread(
+                resolve_ffmpeg, self.settings.ffmpeg_path
+            )
             self.service.set_ffmpeg(self._ffmpeg)
         return self._ffmpeg
 

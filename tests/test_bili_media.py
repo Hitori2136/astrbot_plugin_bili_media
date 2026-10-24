@@ -7,6 +7,7 @@ import json
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 import wave
@@ -248,6 +249,20 @@ class UrlTests(unittest.TestCase):
             asyncio.run(bili.parse_bili_target("av170001")).video_id, "av170001"
         )
 
+    def test_bv_case_is_preserved(self):
+        bvid = "BV1GJ411x7h7"
+        self.assertEqual(bili._video_id_from_segment(bvid), bvid)
+        target = asyncio.run(
+            bili.parse_bili_target(f"https://www.bilibili.com/video/{bvid}")
+        )
+        self.assertEqual(target.video_id, bvid)
+        self.assertIn(bvid, target.url)
+
+    def test_lowercase_bv_is_rejected(self):
+        # BVID 区分大小写；不能把 bv... 改写成 BV... 后当成有效 ID。
+        with self.assertRaises(bili.UsageError):
+            asyncio.run(bili.parse_bili_target("bv1gj411x7h7"))
+
     def test_no_scheme_and_mobile_host(self):
         target = asyncio.run(
             bili.parse_bili_target("m.bilibili.com/video/BV1GJ411x7h7")
@@ -424,6 +439,32 @@ class FfmpegTests(unittest.TestCase):
             with self.assertRaises(bili.FfmpegMissingError):
                 bili.resolve_ffmpeg("")
 
+    def test_limit_settings_are_clamped(self):
+        settings = bili.PluginSettings.from_config(
+            {"max_download_mb": 0, "max_parse_mb": 999}
+        )
+        self.assertEqual(settings.max_download_mb, 10)
+        self.assertEqual(settings.max_parse_mb, 128)
+
+
+class WorkerTests(unittest.TestCase):
+    def test_timeout_kills_worker(self):
+        tmp = Path(tempfile.mkdtemp(prefix="bili_worker_"))
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        worker = tmp / "slow_worker.py"
+        worker.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+
+        settings = bili.PluginSettings(timeout_seconds=1)
+        service = bili.BiliService(settings)
+        service.worker_path = worker
+
+        started = time.monotonic()
+        with self.assertRaises(bili.DownloadFailedError):
+            asyncio.run(
+                service._extract("https://example.com/video", {}, download=False)
+            )
+        self.assertLess(time.monotonic() - started, 8.0)
+
 
 class RedactTests(unittest.TestCase):
     def test_cookie_and_url_credentials(self):
@@ -538,12 +579,12 @@ class LoginTests(PluginTestBase):
             state=0,
             payload={
                 "url": "https://passport.biligame.com/crossDomain?"
-                "SESSDATA=from-url&bili_jct=jwt&DedeUserID=7"
+                "SESSDATA=from%2Curl&bili_jct=jwt&DedeUserID=7"
             },
             set_cookies=[],
         )
         cookie = bili.BiliLoginClient.extract_cookie(poll)
-        self.assertIn("SESSDATA=from-url", cookie)
+        self.assertIn("SESSDATA=from,url", cookie)
         self.assertIn("DedeUserID=7", cookie)
 
     def test_extract_cookie_without_sessdata_fails(self):

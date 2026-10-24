@@ -74,6 +74,8 @@ git clone https://github.com/Hitori2136/astrbot_plugin_bili_media
 | `max_concurrent` | `1` | 同时处理的任务数 |
 | `timeout_seconds` | `300` | 单次解析/下载超时 |
 | `max_audio_mb` | `200` | 原始音频文件大小上限 |
+| `max_download_mb` | `500` | 单个下载文件的硬上限，防止异常视频占满磁盘 |
+| `max_parse_mb` | `16` | yt-dlp 解析结果和扫码凭据文件的最大读取大小 |
 | `cookie` | 空 | B 站 Cookie，扫码登录优先；也可手动填 SESSDATA |
 | `cookies_file` | 空 | Netscape 格式 cookies.txt 路径 |
 | `proxy` | 空 | 下载代理，如 `http://127.0.0.1:7890` |

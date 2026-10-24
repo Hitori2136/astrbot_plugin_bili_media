@@ -59,6 +59,18 @@
     "hint": "10-1000。只限制下载的原始音频，不是切片后的语音大小。",
     "default": 200
   },
+  "max_download_mb": {
+    "description": "单次下载文件大小上限（MB）",
+    "type": "int",
+    "hint": "10-2048。yt-dlp 下载任何单个文件的硬上限，防止异常视频占满磁盘；视频仍受 max_video_mb 限制。",
+    "default": 500
+  },
+  "max_parse_mb": {
+    "description": "解析文件大小上限（MB）",
+    "type": "int",
+    "hint": "1-128。yt-dlp 解析结果和本地扫码凭据文件的最大读取大小。",
+    "default": 16
+  },
   "cookie": {
     "description": "B 站 Cookie",
     "type": "string",
