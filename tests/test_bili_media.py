@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -280,6 +281,33 @@ class UrlTests(unittest.TestCase):
         self.assertEqual(target.video_id, "BV1GJ411x7h7")
         self.assertEqual(target.page, 3)
 
+    def test_b23_html_redirect_parsing(self):
+        raw = (
+            '<meta http-equiv="refresh" '
+            'content="0;url=https://www.bilibili.com/video/BV1GJ411x7h7">'
+        ).encode()
+        self.assertEqual(
+            bili._html_redirect_target(raw, "https://b23.tv/abc"),
+            "https://www.bilibili.com/video/BV1GJ411x7h7",
+        )
+        raw_js = (
+            b'<script>window.location.href='
+            b'"https://www.bilibili.com/video/BV1GJ411x7h7"</script>'
+        )
+        self.assertEqual(
+            bili._html_redirect_target(raw_js, "https://b23.tv/abc"),
+            "https://www.bilibili.com/video/BV1GJ411x7h7",
+        )
+
+    def test_b23_resolve_failure_falls_back_to_ytdlp(self):
+        short = "https://b23.tv/abcDEF"
+        with mock.patch.object(
+            bili, "_resolve_b23", side_effect=bili.ShortLinkResolveError("blocked")
+        ):
+            target = asyncio.run(bili.parse_bili_target(short))
+        self.assertEqual(target.url, short)
+        self.assertEqual(target.video_id, "b23")
+
     def test_rejects_other_sites(self):
         with self.assertRaises(bili.UnsupportedLinkError):
             asyncio.run(bili.parse_bili_target("https://youtube.com/watch?v=abc"))
@@ -452,6 +480,15 @@ class FfmpegTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_child_env_includes_sys_path(self):
+        tmp = Path(tempfile.mkdtemp(prefix="bili_site_packages_"))
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        sys.path.insert(0, str(tmp))
+        self.addCleanup(lambda: sys.path.remove(str(tmp)))
+        env = bili._build_child_env()
+        entries = env.get("PYTHONPATH", "").split(os.pathsep)
+        self.assertIn(str(tmp.resolve()), entries)
+
     def test_timeout_kills_worker(self):
         tmp = Path(tempfile.mkdtemp(prefix="bili_worker_"))
         self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))

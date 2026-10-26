@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import math
 import os
@@ -74,6 +75,19 @@ _COOKIE_PAIR_RE = re.compile(
 )
 _URL_CRED_RE = re.compile(r"(?i)(https?://)[^/\s@]+@")
 _TRAILING_CHARS = " \t\r\n<>'\"`，。；！？、,.;!?）)】]》」』&"
+_META_REFRESH_RE = re.compile(
+    r"<meta[^>]+http-equiv=[\"']?refresh[\"']?[^>]*"
+    r"content=[\"'][^\"']*?url=([^\"']+)",
+    re.IGNORECASE,
+)
+_JS_LOCATION_RE = re.compile(
+    r"location(?:\.href)?(?:\.replace)?\s*(?:=|\()\s*[\"']([^\"']+)[\"']",
+    re.IGNORECASE,
+)
+_CANONICAL_RE = re.compile(
+    r"<link[^>]+rel=[\"']canonical[\"'][^>]*href=[\"']([^\"']+)",
+    re.IGNORECASE,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -88,6 +102,10 @@ class UsageError(UserVisibleError):
 
 
 class UnsupportedLinkError(UserVisibleError):
+    pass
+
+
+class ShortLinkResolveError(UserVisibleError):
     pass
 
 
@@ -289,6 +307,27 @@ def _target_from_id(video_id: str, page: int, original: str = "") -> BiliTarget:
     return BiliTarget(video_id=video_id, page=page, url=url, original=original)
 
 
+def _html_redirect_target(raw: bytes, base_url: str) -> str | None:
+    text = raw.decode("utf-8", "ignore")
+    for tag in re.findall(r"<meta[^>]+>", text, re.IGNORECASE):
+        if "refresh" not in tag.lower():
+            continue
+        match = re.search(
+            r"content=[\"'][^\"']*?url=([^\"']+)", tag, re.IGNORECASE
+        )
+        if match:
+            return urllib.parse.urljoin(
+                base_url, html.unescape(match.group(1).strip())
+            )
+    for pattern in (_JS_LOCATION_RE, _CANONICAL_RE):
+        match = pattern.search(text)
+        if match:
+            return urllib.parse.urljoin(
+                base_url, html.unescape(match.group(1).strip())
+            )
+    return None
+
+
 def _resolve_b23_blocking(url: str, timeout: float) -> str:
     request = urllib.request.Request(  # noqa: S310 - 只允许 b23.tv
         url,
@@ -296,11 +335,19 @@ def _resolve_b23_blocking(url: str, timeout: float) -> str:
             "User-Agent": USER_AGENT,
             "Referer": BILI_REFERER,
             "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Accept-Encoding": "identity",
         },
         method="GET",
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
-        return str(response.geturl())
+        final = str(response.geturl())
+        if final != url and _is_bili_host(
+            (urllib.parse.urlsplit(final).hostname or "").lower()
+        ):
+            return final
+        raw = response.read(64 * 1024)
+    return _html_redirect_target(raw, url) or final
 
 
 async def _resolve_b23(url: str, timeout: float = 10.0) -> str:
@@ -309,14 +356,20 @@ async def _resolve_b23(url: str, timeout: float = 10.0) -> str:
             asyncio.to_thread(_resolve_b23_blocking, url, timeout), timeout=timeout + 5
         )
     except asyncio.TimeoutError as exc:
-        raise UserVisibleError("短链解析超时，请稍后重试或换用完整链接。") from exc
+        raise ShortLinkResolveError(
+            "短链解析超时，请稍后重试或换用完整链接。"
+        ) from exc
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        logger.debug("b23 resolve failed: %s", redact(exc))
-        raise UserVisibleError("短链解析失败，请检查链接或换用完整链接。") from exc
+        logger.warning("b23 resolve failed: %s", redact(exc))
+        raise ShortLinkResolveError(
+            "短链解析失败，请检查链接或换用完整链接。"
+        ) from exc
 
     host = (urllib.parse.urlsplit(final).hostname or "").lower()
-    if final == url or not _is_bili_host(host):
-        raise UserVisibleError("短链没有跳转到 B 站视频，请换用完整链接。")
+    if final == url:
+        raise ShortLinkResolveError("短链没有返回可识别的跳转。")
+    if not _is_bili_host(host):
+        raise UnsupportedLinkError("短链跳转到了非 B 站地址，已拒绝。")
     return final
 
 
@@ -342,8 +395,18 @@ async def parse_bili_target(text: str, timeout: float = 10.0) -> BiliTarget:
 
     host = (parts.hostname or "").lower().rstrip(".")
     if host == "b23.tv" or host.endswith(".b23.tv"):
-        final = await _resolve_b23(token, timeout)
-        return await parse_bili_target(final, timeout)
+        try:
+            final = await _resolve_b23(token, timeout)
+            return await parse_bili_target(final, timeout)
+        except ShortLinkResolveError as exc:
+            # b23 在部分网络下会返回 HTML 跳转而不是 HTTP 302。
+            # 解析不出来时把短链直接交给 yt-dlp，它有自己的 B 站短链处理。
+            logger.warning(
+                "b23 预解析失败，回退给 yt-dlp：%s", redact(str(exc))
+            )
+            return BiliTarget(
+                video_id="b23", page=1, url=token, original=token
+            )
 
     if not _is_bili_host(host):
         raise UnsupportedLinkError(
@@ -933,6 +996,38 @@ async def _kill_process(process: asyncio.subprocess.Process) -> None:
         pass
 
 
+def _build_child_env() -> dict[str, str]:
+    """把主进程的模块搜索路径传给 worker。
+
+    AstrBot 会把插件依赖装到 ``data/site-packages`` 并插入当前进程的
+    ``sys.path``；子进程不会自动继承这些运行时修改，必须通过 PYTHONPATH 传下去。
+    """
+    env = os.environ.copy()
+    paths: list[str] = []
+    seen: set[str] = set()
+    candidates = list(sys.path)
+    existing = env.get("PYTHONPATH", "")
+    if existing:
+        candidates.extend(existing.split(os.pathsep))
+    for entry in candidates:
+        if not entry:
+            continue
+        try:
+            resolved = Path(entry).resolve()
+        except OSError:
+            continue
+        if not resolved.is_dir():
+            continue
+        key = os.path.normcase(str(resolved))
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(str(resolved))
+    if paths:
+        env["PYTHONPATH"] = os.pathsep.join(paths)
+    return env
+
+
 class BiliService:
     """把 yt-dlp 的同步调用包在 asyncio.to_thread 里。"""
 
@@ -1041,6 +1136,7 @@ class BiliService:
             popen_kwargs: dict[str, Any] = {
                 "stdout": subprocess.DEVNULL,
                 "cwd": str(workdir),
+                "env": _build_child_env(),
             }
             if os.name == "nt":
                 popen_kwargs["creationflags"] = getattr(
