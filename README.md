@@ -97,10 +97,6 @@ git clone https://github.com/Hitori2136/astrbot_plugin_bili_media
 普通 QQ 语音最长 60 秒，所以插件会把音频切片后逐条发送；超过
 `max_audio_chunks` 的视频只发送前 N 段，并给出提示。
 
-> QQ 官方机器人的**视频**消息依赖 AstrBot 4.29+ 的 `qqofficial` 适配器；
-> 某些更早的官方适配器只处理图片和语音。若使用旧版，请优先用 OneBot/NapCat，
-> 或升级 AstrBot。音频消息在旧版上仍可发送。
-
 ## License
 
 MIT，详见 [LICENSE](LICENSE)。
