@@ -274,39 +274,17 @@ class UrlTests(unittest.TestCase):
         )
         self.assertEqual(target.video_id, "BV1GJ411x7h7")
 
-    def test_b23_short_link(self):
-        final = "https://www.bilibili.com/video/BV1GJ411x7h7/?p=3&spm=x"
-        with mock.patch.object(bili, "_resolve_b23_blocking", return_value=final):
-            target = asyncio.run(bili.parse_bili_target("https://b23.tv/abcDEF"))
+    def test_b23_direct_bv_link(self):
+        target = asyncio.run(
+            bili.parse_bili_target("https://b23.tv/BV1GJ411x7h7?p=2")
+        )
         self.assertEqual(target.video_id, "BV1GJ411x7h7")
-        self.assertEqual(target.page, 3)
+        self.assertEqual(target.page, 2)
 
-    def test_b23_html_redirect_parsing(self):
-        raw = (
-            '<meta http-equiv="refresh" '
-            'content="0;url=https://www.bilibili.com/video/BV1GJ411x7h7">'
-        ).encode()
-        self.assertEqual(
-            bili._html_redirect_target(raw, "https://b23.tv/abc"),
-            "https://www.bilibili.com/video/BV1GJ411x7h7",
-        )
-        raw_js = (
-            b'<script>window.location.href='
-            b'"https://www.bilibili.com/video/BV1GJ411x7h7"</script>'
-        )
-        self.assertEqual(
-            bili._html_redirect_target(raw_js, "https://b23.tv/abc"),
-            "https://www.bilibili.com/video/BV1GJ411x7h7",
-        )
-
-    def test_b23_resolve_failure_falls_back_to_ytdlp(self):
-        short = "https://b23.tv/abcDEF"
-        with mock.patch.object(
-            bili, "_resolve_b23", side_effect=bili.ShortLinkResolveError("blocked")
-        ):
-            target = asyncio.run(bili.parse_bili_target(short))
-        self.assertEqual(target.url, short)
-        self.assertEqual(target.video_id, "b23")
+    def test_b23_arbitrary_code_rejected(self):
+        with self.assertRaises(bili.UnsupportedLinkError) as ctx:
+            asyncio.run(bili.parse_bili_target("https://b23.tv/EkD01Wz"))
+        self.assertIn("完整视频链接", str(ctx.exception))
 
     def test_rejects_other_sites(self):
         with self.assertRaises(bili.UnsupportedLinkError):

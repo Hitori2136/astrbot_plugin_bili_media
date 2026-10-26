@@ -5,7 +5,7 @@
     /提取音频 <B 站视频链接>   提取音频，按 60 秒切片发送 QQ 语音条
 
 设计约束（按 AstrBot 4.29.1 / 4.19.5 的公共接口编写）：
-- 只处理 B 站普通视频：BV/av 号、b23.tv 短链、分 P 链接；
+- 只处理 B 站普通视频：BV/av 号、b23.tv/BV 或 av 链接、分 P 链接；
 - 视频走 yt-dlp，默认 720P / 30MB 上限；
 - 音频走 yt-dlp + ffmpeg 转 16kHz 单声道 WAV，再用标准库 wave 切片；
 - 语音使用 AstrBot 的 Record 组件：OneBot/NapCat 与 QQ 官方机器人各自会转 silk；
@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import math
 import os
@@ -75,19 +74,6 @@ _COOKIE_PAIR_RE = re.compile(
 )
 _URL_CRED_RE = re.compile(r"(?i)(https?://)[^/\s@]+@")
 _TRAILING_CHARS = " \t\r\n<>'\"`，。；！？、,.;!?）)】]》」』&"
-_META_REFRESH_RE = re.compile(
-    r"<meta[^>]+http-equiv=[\"']?refresh[\"']?[^>]*"
-    r"content=[\"'][^\"']*?url=([^\"']+)",
-    re.IGNORECASE,
-)
-_JS_LOCATION_RE = re.compile(
-    r"location(?:\.href)?(?:\.replace)?\s*(?:=|\()\s*[\"']([^\"']+)[\"']",
-    re.IGNORECASE,
-)
-_CANONICAL_RE = re.compile(
-    r"<link[^>]+rel=[\"']canonical[\"'][^>]*href=[\"']([^\"']+)",
-    re.IGNORECASE,
-)
 
 
 # --------------------------------------------------------------------------- #
@@ -102,10 +88,6 @@ class UsageError(UserVisibleError):
 
 
 class UnsupportedLinkError(UserVisibleError):
-    pass
-
-
-class ShortLinkResolveError(UserVisibleError):
     pass
 
 
@@ -307,72 +289,6 @@ def _target_from_id(video_id: str, page: int, original: str = "") -> BiliTarget:
     return BiliTarget(video_id=video_id, page=page, url=url, original=original)
 
 
-def _html_redirect_target(raw: bytes, base_url: str) -> str | None:
-    text = raw.decode("utf-8", "ignore")
-    for tag in re.findall(r"<meta[^>]+>", text, re.IGNORECASE):
-        if "refresh" not in tag.lower():
-            continue
-        match = re.search(
-            r"content=[\"'][^\"']*?url=([^\"']+)", tag, re.IGNORECASE
-        )
-        if match:
-            return urllib.parse.urljoin(
-                base_url, html.unescape(match.group(1).strip())
-            )
-    for pattern in (_JS_LOCATION_RE, _CANONICAL_RE):
-        match = pattern.search(text)
-        if match:
-            return urllib.parse.urljoin(
-                base_url, html.unescape(match.group(1).strip())
-            )
-    return None
-
-
-def _resolve_b23_blocking(url: str, timeout: float) -> str:
-    request = urllib.request.Request(  # noqa: S310 - 只允许 b23.tv
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Referer": BILI_REFERER,
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "zh-CN,zh;q=0.9",
-            "Accept-Encoding": "identity",
-        },
-        method="GET",
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
-        final = str(response.geturl())
-        if final != url and _is_bili_host(
-            (urllib.parse.urlsplit(final).hostname or "").lower()
-        ):
-            return final
-        raw = response.read(64 * 1024)
-    return _html_redirect_target(raw, url) or final
-
-
-async def _resolve_b23(url: str, timeout: float = 10.0) -> str:
-    try:
-        final = await asyncio.wait_for(
-            asyncio.to_thread(_resolve_b23_blocking, url, timeout), timeout=timeout + 5
-        )
-    except asyncio.TimeoutError as exc:
-        raise ShortLinkResolveError(
-            "短链解析超时，请稍后重试或换用完整链接。"
-        ) from exc
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        logger.warning("b23 resolve failed: %s", redact(exc))
-        raise ShortLinkResolveError(
-            "短链解析失败，请检查链接或换用完整链接。"
-        ) from exc
-
-    host = (urllib.parse.urlsplit(final).hostname or "").lower()
-    if final == url:
-        raise ShortLinkResolveError("短链没有返回可识别的跳转。")
-    if not _is_bili_host(host):
-        raise UnsupportedLinkError("短链跳转到了非 B 站地址，已拒绝。")
-    return final
-
-
 async def parse_bili_target(text: str, timeout: float = 10.0) -> BiliTarget:
     """把用户输入解析成规范的 B 站视频地址。"""
     token = _extract_url_token(text)
@@ -395,22 +311,24 @@ async def parse_bili_target(text: str, timeout: float = 10.0) -> BiliTarget:
 
     host = (parts.hostname or "").lower().rstrip(".")
     if host == "b23.tv" or host.endswith(".b23.tv"):
-        try:
-            final = await _resolve_b23(token, timeout)
-            return await parse_bili_target(final, timeout)
-        except ShortLinkResolveError as exc:
-            # b23 在部分网络下会返回 HTML 跳转而不是 HTTP 302。
-            # 解析不出来时把短链直接交给 yt-dlp，它有自己的 B 站短链处理。
-            logger.warning(
-                "b23 预解析失败，回退给 yt-dlp：%s", redact(str(exc))
-            )
-            return BiliTarget(
-                video_id="b23", page=1, url=token, original=token
-            )
+        short_segments = [
+            urllib.parse.unquote(item) for item in parts.path.split("/") if item
+        ]
+        if short_segments:
+            video_id = _video_id_from_segment(short_segments[0])
+            if video_id:
+                return _target_from_id(
+                    video_id, _query_page(parts.query), token
+                )
+        raise UnsupportedLinkError(
+            "暂不支持 b23.tv 任意短码：服务器访问短链时会被 B 站返回 412 风控。\n"
+            "请在 B 站 App/网页里复制完整视频链接（含 BV 号）后再发送，例如：\n"
+            "https://www.bilibili.com/video/BV1xx411c7mD"
+        )
 
     if not _is_bili_host(host):
         raise UnsupportedLinkError(
-            "只支持 B 站普通视频链接（BV/av 号、b23.tv 短链）；其他站点暂不支持。"
+            "只支持 B 站普通视频链接（BV/av 号）；其他站点暂不支持。"
         )
 
     segments = [urllib.parse.unquote(item) for item in parts.path.split("/") if item]
